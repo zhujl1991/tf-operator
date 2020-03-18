@@ -24,8 +24,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
-	common "github.com/kubeflow/common/job_controller/api/v1"
-	tfv1 "github.com/kubeflow/tf-operator/pkg/apis/tensorflow/v1"
+	common "github.com/kubeflow/tf-operator/pkg/apis/common/v1beta2"
+	tfv1beta2 "github.com/kubeflow/tf-operator/pkg/apis/tensorflow/v1beta2"
 	"github.com/kubeflow/tf-operator/pkg/common/jobcontroller"
 	tflogger "github.com/kubeflow/tf-operator/pkg/logger"
 	train_util "github.com/kubeflow/tf-operator/pkg/util/train"
@@ -35,7 +35,8 @@ const (
 	// tfConfig is the environment variable name of TensorFlow cluster spec.
 	tfConfig = "TF_CONFIG"
 
-	gangSchedulingPodGroupAnnotation = "scheduling.k8s.io/group-name"
+	// gang scheduler name.
+	gangSchedulerName = "kube-batch"
 
 	// podTemplateRestartPolicyReason is the warning reason when the restart
 	// policy is set in pod template.
@@ -50,9 +51,9 @@ const (
 // reconcilePods checks and updates pods for each given TFReplicaSpec.
 // It will requeue the tfjob in case of an error while creating/deleting pods.
 func (tc *TFController) reconcilePods(
-	tfjob *tfv1.TFJob,
+	tfjob *tfv1beta2.TFJob,
 	pods []*v1.Pod,
-	rtype tfv1.TFReplicaType,
+	rtype tfv1beta2.TFReplicaType,
 	spec *common.ReplicaSpec, rstatus map[string]v1.PodPhase) error {
 
 	// Convert TFReplicaType to lower string.
@@ -70,21 +71,7 @@ func (tc *TFController) reconcilePods(
 
 	initializeTFReplicaStatuses(tfjob, rtype)
 
-	podSlices, podsToBeRemoved := tc.GetPodSlices(pods, replicas, logger)
-
-	// Scale down
-	if tfjob.Spec.EnableDynamicWorker && len(podsToBeRemoved) > 0 {
-		// Currently only allow to scale down workers
-		if rtype == tfv1.TFReplicaTypeWorker {
-			logger.Infof("Removing %d workers", len(podsToBeRemoved))
-			for _, pods := range podsToBeRemoved {
-				tc.PodControl.DeletePod(tfjob.Namespace, pods.Name, tfjob)
-			}
-		} else {
-			logger.Warningf("Trying to scale down %s pods, which might be a mistake", rt)
-		}
-	}
-
+	podSlices, _ := tc.GetPodSlices(pods, replicas, logger)
 	for index, podSlice := range podSlices {
 		masterRole = false
 		if len(podSlice) > 1 {
@@ -96,11 +83,11 @@ func (tc *TFController) reconcilePods(
 			// if master pod is present, select the master pod
 			// if master is not present, first worker pod is selected as the master.
 			if ContainChieforMasterSpec(tfjob) {
-				if tfv1.IsChieforMaster(rtype) {
+				if tfv1beta2.IsChieforMaster(rtype) {
 					masterRole = true
 				}
 			} else {
-				if tfv1.IsWorker(rtype) && (index == 0) {
+				if tfv1beta2.IsWorker(rtype) && (index == 0) {
 					masterRole = true
 				}
 			}
@@ -115,7 +102,7 @@ func (tc *TFController) reconcilePods(
 			var exitCode int32 = 0xbeef // magic number
 			for _, status := range pod.Status.ContainerStatuses {
 				state := status.State
-				if status.Name == tfv1.DefaultContainerName && state.Terminated != nil {
+				if status.Name == tfv1beta2.DefaultContainerName && state.Terminated != nil {
 					exitCode = state.Terminated.ExitCode
 					logger.Infof("Pod: %v.%v exited with code %v", pod.Namespace, pod.Name, exitCode)
 					tc.Recorder.Eventf(tfjob, v1.EventTypeNormal, exitedWithCodeReason, "Pod: %v.%v exited with code %v", pod.Namespace, pod.Name, exitCode)
@@ -133,7 +120,7 @@ func (tc *TFController) reconcilePods(
 			}
 
 			// Check whether worker 0 is exited without error.
-			if rtype == tfv1.TFReplicaTypeWorker && index == 0 &&
+			if rtype == tfv1beta2.TFReplicaTypeWorker && index == 0 &&
 				exitCode == 0 && pod.Status.Phase == v1.PodSucceeded {
 				worker0Completed = true
 			}
@@ -145,7 +132,7 @@ func (tc *TFController) reconcilePods(
 }
 
 // createNewPod creates a new pod for the given index and type.
-func (tc *TFController) createNewPod(tfjob *tfv1.TFJob, rt, index string, spec *common.ReplicaSpec, masterRole bool) error {
+func (tc *TFController) createNewPod(tfjob *tfv1beta2.TFJob, rt, index string, spec *common.ReplicaSpec, masterRole bool) error {
 	tfjobKey, err := KeyFunc(tfjob)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("couldn't get key for tfjob object %#v: %v", tfjob, err))
@@ -199,19 +186,13 @@ func (tc *TFController) createNewPod(tfjob *tfv1.TFJob, rt, index string, spec *
 	// 1. if user has specified other scheduler, we report a warning without overriding any fields.
 	// 2. if no SchedulerName is set for pods, then we set the SchedulerName to "kube-batch".
 	if tc.Config.EnableGangScheduling {
-		if tc.isNonGangSchedulerSet(tfjob) {
+		if isNonGangSchedulerSet(tfjob) {
 			errMsg := "Another scheduler is specified when gang-scheduling is enabled and it will not be overwritten"
 			logger.Warning(errMsg)
 			tc.Recorder.Event(tfjob, v1.EventTypeWarning, podTemplateSchedulerNameReason, errMsg)
 		} else {
-			podTemplate.Spec.SchedulerName = tc.Config.GangSchedulerName
+			podTemplate.Spec.SchedulerName = gangSchedulerName
 		}
-
-		if podTemplate.Annotations == nil {
-			podTemplate.Annotations = map[string]string{}
-		}
-		podTemplate.Annotations[gangSchedulingPodGroupAnnotation] =
-			jobcontroller.GenPodGroupName(tfjob.Name)
 	}
 
 	err = tc.PodControl.CreatePodsWithControllerRef(tfjob.Namespace, podTemplate, tfjob, controllerRef)
@@ -230,12 +211,7 @@ func (tc *TFController) createNewPod(tfjob *tfv1.TFJob, rt, index string, spec *
 	return nil
 }
 
-// setClusterSpec generates and sets TF_CONFIG for the given podTemplateSpec.
-func setClusterSpec(podTemplateSpec *v1.PodTemplateSpec, tfjob *tfv1.TFJob, rt, index string) error {
-	// Do not set TF_CONFIG for local training jobs.
-	if !isDistributed(tfjob) {
-		return nil
-	}
+func setClusterSpec(podTemplateSpec *v1.PodTemplateSpec, tfjob *tfv1beta2.TFJob, rt, index string) error {
 	// Generate TF_CONFIG JSON string.
 	tfConfigStr, err := genTFConfigJSONStr(tfjob, rt, index)
 	if err != nil {
@@ -245,45 +221,17 @@ func setClusterSpec(podTemplateSpec *v1.PodTemplateSpec, tfjob *tfv1.TFJob, rt, 
 	if tfConfigStr == "" {
 		return nil
 	}
-	// Add TF_CONFIG environment variable to tensorflow container in the pod.
+	// Add TF_CONFIG environment variable.
 	for i := range podTemplateSpec.Spec.Containers {
-		if podTemplateSpec.Spec.Containers[i].Name == tfv1.DefaultContainerName {
-			if len(podTemplateSpec.Spec.Containers[i].Env) == 0 {
-				podTemplateSpec.Spec.Containers[i].Env = make([]v1.EnvVar, 0)
-			}
-			podTemplateSpec.Spec.Containers[i].Env = append(podTemplateSpec.Spec.Containers[i].Env, v1.EnvVar{
-				Name:  tfConfig,
-				Value: tfConfigStr,
-			})
-			break
+		if len(podTemplateSpec.Spec.Containers[i].Env) == 0 {
+			podTemplateSpec.Spec.Containers[i].Env = make([]v1.EnvVar, 0)
 		}
+		podTemplateSpec.Spec.Containers[i].Env = append(podTemplateSpec.Spec.Containers[i].Env, v1.EnvVar{
+			Name:  tfConfig,
+			Value: tfConfigStr,
+		})
 	}
 	return nil
-}
-
-// isDistributed returns if the TFJob is a distributed training job.
-// Ref https://github.com/kubeflow/tf-operator/issues/1078.
-func isDistributed(tfjob *tfv1.TFJob) bool {
-	replicas := tfjob.Spec.TFReplicaSpecs
-	distributionCount := 0
-	allTypes := []tfv1.TFReplicaType{
-		tfv1.TFReplicaTypeChief,
-		tfv1.TFReplicaTypeEval,
-		tfv1.TFReplicaTypeMaster,
-		tfv1.TFReplicaTypePS,
-		tfv1.TFReplicaTypeWorker,
-	}
-	// Check if there is only one replica.
-	for _, typ := range allTypes {
-		if replicas[typ] != nil {
-			if replicas[typ].Replicas == nil {
-				distributionCount++
-			} else {
-				distributionCount += int(*replicas[typ].Replicas)
-			}
-		}
-	}
-	return distributionCount != 1
 }
 
 func setRestartPolicy(podTemplateSpec *v1.PodTemplateSpec, spec *common.ReplicaSpec) {
@@ -294,9 +242,9 @@ func setRestartPolicy(podTemplateSpec *v1.PodTemplateSpec, spec *common.ReplicaS
 	}
 }
 
-func (tc *TFController) isNonGangSchedulerSet(tfjob *tfv1.TFJob) bool {
+func isNonGangSchedulerSet(tfjob *tfv1beta2.TFJob) bool {
 	for _, spec := range tfjob.Spec.TFReplicaSpecs {
-		if spec.Template.Spec.SchedulerName != "" && spec.Template.Spec.SchedulerName != tc.Config.GangSchedulerName {
+		if spec.Template.Spec.SchedulerName != "" && spec.Template.Spec.SchedulerName != gangSchedulerName {
 			return true
 		}
 	}

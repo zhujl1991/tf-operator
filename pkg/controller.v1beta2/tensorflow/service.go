@@ -24,8 +24,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
-	common "github.com/kubeflow/common/job_controller/api/v1"
-	tfv1 "github.com/kubeflow/tf-operator/pkg/apis/tensorflow/v1"
+	common "github.com/kubeflow/tf-operator/pkg/apis/common/v1beta2"
+	tfv1beta2 "github.com/kubeflow/tf-operator/pkg/apis/tensorflow/v1beta2"
 	"github.com/kubeflow/tf-operator/pkg/common/jobcontroller"
 	tflogger "github.com/kubeflow/tf-operator/pkg/logger"
 )
@@ -33,9 +33,9 @@ import (
 // reconcileServices checks and updates services for each given TFReplicaSpec.
 // It will requeue the tfjob in case of an error while creating/deleting services.
 func (tc *TFController) reconcileServices(
-	tfjob *tfv1.TFJob,
+	tfjob *tfv1beta2.TFJob,
 	services []*v1.Service,
-	rtype tfv1.TFReplicaType,
+	rtype tfv1beta2.TFReplicaType,
 	spec *common.ReplicaSpec) error {
 
 	// Convert TFReplicaType to lower string.
@@ -48,20 +48,7 @@ func (tc *TFController) reconcileServices(
 		return err
 	}
 
-	serviceSlices, servicesToBeRemoved := tc.GetServiceSlices(services, replicas, tflogger.LoggerForReplica(tfjob, rt))
-
-	// Scale down
-	if tfjob.Spec.EnableDynamicWorker && len(servicesToBeRemoved) > 0 {
-		// Currently only allow to scale down services for workers
-		if rtype == tfv1.TFReplicaTypeWorker {
-			tflogger.LoggerForReplica(tfjob, rt).Infof("Removing %d services", len(servicesToBeRemoved))
-			for _, service := range servicesToBeRemoved {
-				tc.ServiceControl.DeleteService(tfjob.Namespace, service.Name, tfjob)
-			}
-		} else {
-			tflogger.LoggerForReplica(tfjob, rt).Warningf("Trying to scale down %s services, which might be a mistake", rt)
-		}
-	}
+	serviceSlices, _ := tc.GetServiceSlices(services, replicas, tflogger.LoggerForReplica(tfjob, rt))
 
 	for index, serviceSlice := range serviceSlices {
 		if len(serviceSlice) > 1 {
@@ -80,7 +67,7 @@ func (tc *TFController) reconcileServices(
 }
 
 // createNewService creates a new service for the given index and type.
-func (tc *TFController) createNewService(tfjob *tfv1.TFJob, rtype tfv1.TFReplicaType, index string, spec *common.ReplicaSpec) error {
+func (tc *TFController) createNewService(tfjob *tfv1beta2.TFJob, rtype tfv1beta2.TFReplicaType, index string, spec *common.ReplicaSpec) error {
 	tfjobKey, err := KeyFunc(tfjob)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("couldn't get key for tfjob object %#v: %v", tfjob, err))
@@ -114,7 +101,7 @@ func (tc *TFController) createNewService(tfjob *tfv1.TFJob, rtype tfv1.TFReplica
 			Selector:  labels,
 			Ports: []v1.ServicePort{
 				{
-					Name: tfv1.DefaultPortName,
+					Name: tfv1beta2.DefaultPortName,
 					Port: port,
 				},
 			},
